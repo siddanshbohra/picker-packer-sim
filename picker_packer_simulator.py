@@ -613,22 +613,27 @@ def _merge_hourly_with_throughput(
 def load_data(source_key: str) -> tuple[pd.DataFrame, str]:
     df: Optional[pd.DataFrame] = None
     label = ""
+    live_df: Optional[pd.DataFrame] = None
     if source_key == "live":
-        df = _fetch_from_superset()
-        if df is not None and not df.empty:
+        live_df = _fetch_from_superset()
+        if live_df is not None and not live_df.empty:
             stamp = datetime.now().strftime("%Y%m%d_%H%M")
             out = SNAPSHOTS_DIR / f"picker_sim_{stamp}.csv"
-            df.to_csv(out, index=False)
-            label = f"Live Superset — {out.name}"
+            live_df.to_csv(out, index=False)
     throughput_df = _from_throughput_csv()
     hourly_orders_df = _from_hourly_orders_csv()
 
     if df is None and hourly_orders_df is not None:
         df = _merge_hourly_with_throughput(hourly_orders_df, throughput_df)
-        label = "Rolling Hourly Orders CSV (source) + throughput manpower overlay"
+        label = "Rolling Hourly Orders CSV (source of truth) + throughput manpower overlay"
+        if source_key == "live" and live_df is not None and not live_df.empty:
+            label += " · Superset snapshot refreshed"
     if df is None and throughput_df is not None:
         df = throughput_df
         label = "Throughput CSV — picker_packer_hourly_throughput_4w.csv"
+    if df is None and live_df is not None and not live_df.empty:
+        df = live_df
+        label = "Live Superset (CSV missing)"
     if df is None:
         snaps = sorted(SNAPSHOTS_DIR.glob("picker_sim_*.csv"))
         if snaps:

@@ -1,0 +1,6 @@
+data/snapshots/
+data/exports/
+__pycache__/
+*.pyc
+.DS_Store
+.env

@@ -454,7 +454,7 @@ def _generate_mock_data() -> pd.DataFrame:
     rng = np.random.default_rng(42)
     today = datetime.now().date()
     dates = [today - timedelta(days=i) for i in range(1, 29)]
-    chs = list(WH_NAME_MAP.keys())[:8]
+    chs = list(WH_NAME_MAP.keys())
     rows: list[dict] = []
     for d in dates:
         for h in range(8, 23):
@@ -1382,6 +1382,15 @@ def main() -> None:
     df_raw, source_label = load_data(source_key)
     if source_key == "live":
         st.session_state["_data_source"] = "snapshot"
+
+    is_mock = "Synthetic" in source_label
+    if is_mock:
+        st.warning(
+            "**Synthetic mock data — all numbers below are illustrative only.**  \n"
+            "To load real data: commit `data/exports/picker_packer_hourly_throughput_4w.csv` "
+            "to the repo, or click *Refresh from Superset* on a machine with network access.",
+            icon="⚠️",
+        )
 
     params = render_sidebar(df_raw, source_label)
     df_filtered = apply_filters(df_raw, params)

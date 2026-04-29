@@ -458,8 +458,6 @@ def _from_throughput_csv() -> Optional[pd.DataFrame]:
     )
 
     optional_cols = {
-        "active_pickers": "actual_pickers",
-        "active_packers": "actual_packers",
         "orders_picked": "orders_picked",
         "orders_packed": "orders_packed",
         "units_picked": "units_picked",
@@ -668,7 +666,7 @@ def load_data(source_key: str) -> tuple[pd.DataFrame, str]:
     df["order_hour"] = df["order_hour"].astype(int)
     df["order_count"] = df["order_count"].astype(int)
     df["total_units"] = df["total_units"].astype(int)
-    for col in ["actual_pickers", "actual_packers", "orders_packed", "units_packed"]:
+    for col in ["orders_packed", "units_packed"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
         else:
@@ -1092,22 +1090,14 @@ def render_kpis(df: pd.DataFrame, params: dict) -> None:
         return
 
     n_days = max(df["order_date"].nunique(), 1)
-    has_actual_counts = (
-        "actual_pickers" in df.columns
-        and "actual_packers" in df.columns
-        and df["actual_pickers"].notna().any()
-        and df["actual_packers"].notna().any()
-    )
-    picker_count_col = "actual_pickers" if has_actual_counts else "pickers_required"
-    packer_count_col = "actual_packers" if has_actual_counts else "packers_required"
-    count_source = "Superset active users" if has_actual_counts else "Modeled required"
+    count_source = "Modeled constrained"
 
-    avg_pickers = df[picker_count_col].mean()
-    avg_packers = df[packer_count_col].mean()
+    avg_pickers = df["pickers_required"].mean()
+    avg_packers = df["packers_required"].mean()
 
-    peak_idx = (df[picker_count_col] + df[packer_count_col]).idxmax()
+    peak_idx = (df["pickers_required"] + df["packers_required"]).idxmax()
     peak_row = df.loc[peak_idx]
-    peak_total = int(peak_row[picker_count_col] + peak_row[packer_count_col])
+    peak_total = int(peak_row["pickers_required"] + peak_row["packers_required"])
     peak_label = f"{peak_row['order_date']}  {int(peak_row['order_hour']):02d}:00  {peak_row['ch_id']}"
 
     total_orders = df["order_count"].sum()
@@ -1200,12 +1190,6 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
     if df.empty:
         st.info("No data.")
         return
-    has_actual_counts = (
-        "actual_pickers" in df.columns
-        and "actual_packers" in df.columns
-        and df["actual_pickers"].notna().any()
-        and df["actual_packers"].notna().any()
-    )
 
     st.markdown(
         '<p style="font-size:12px;color:#6B7280;margin:0 0 16px 0;">'
@@ -1347,15 +1331,8 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
     with st.expander("How is this calculated?", expanded=False):
-        actual_formula = (
-            "actual_pickers / actual_packers = COUNT(DISTINCT user_id) from "
-            "fulfilment_order_audits PICKED/PACKED events<br><br>"
-            if has_actual_counts
-            else ""
-        )
         formula_box(
-            actual_formula
-            + f"pickers_ideal      = ceil( units / {params['picker_throughput']} "
+            f"pickers_ideal      = ceil( units / {params['picker_throughput']} "
             f"× {1 + params['picker_buffer']/100:.2f} )  — no cap applied<br>"
             f"pickers_constrained = min( pickers_ideal, {params['max_pickers_per_ch']} )<br><br>"
             f"packers_ideal      = ceil( units / {params['packer_throughput']} "
@@ -1373,29 +1350,15 @@ def render_tab_raw(df: pd.DataFrame, params: dict) -> None:
     display_cols = [
         "order_date", "order_hour", "ch_id",
         "order_count", "total_units", "upo",
+        "pickers_uncapped", "pickers_required", "pick_breach_orders",
+        "packers_uncapped", "packers_required", "pack_breach_orders",
+        "uph_picker", "uph_packer",
     ]
-    has_actual_counts = (
-        "actual_pickers" in df.columns
-        and "actual_packers" in df.columns
-        and df["actual_pickers"].notna().any()
-        and df["actual_packers"].notna().any()
-    )
-    if has_actual_counts:
-        display_cols.extend(["actual_pickers", "actual_packers", "orders_packed", "units_packed"])
-    display_cols.extend(
-        [
-            "pickers_uncapped", "pickers_required", "pick_breach_orders",
-            "packers_uncapped", "packers_required", "pack_breach_orders",
-            "uph_picker", "uph_packer",
-        ]
-    )
 
     show = df[display_cols].rename(
         columns={
             "order_date": "Date", "order_hour": "Hour", "ch_id": "CH",
             "order_count": "Orders", "total_units": "Units", "upo": "UPO",
-            "actual_pickers": "Actual Pickers", "actual_packers": "Actual Packers",
-            "orders_packed": "Orders Packed", "units_packed": "Units Packed",
             "pickers_uncapped": "Pickers Ideal", "pickers_required": "Pickers Constrained",
             "pick_breach_orders": "Pick Breach Orders",
             "packers_uncapped": "Packers Ideal", "packers_required": "Packers Constrained",
@@ -1445,14 +1408,8 @@ def render_tab_raw(df: pd.DataFrame, params: dict) -> None:
     )
 
     with st.expander("Column definitions", expanded=False):
-        actual_definition = (
-            "Actual Pickers / Packers = distinct audit users in PICKED/PACKED events for that CH-hour<br>"
-            if has_actual_counts
-            else ""
-        )
         formula_box(
-            actual_definition
-            + f"Pickers Ideal      = ceil( Units / {params['picker_throughput']} "
+            f"Pickers Ideal      = ceil( Units / {params['picker_throughput']} "
             f"× {1 + params['picker_buffer']/100:.2f} )  uncapped need<br>"
             f"Pickers Constrained = min( Pickers Ideal, {params['max_pickers_per_ch']} )<br>"
             "Pick Breach Orders  = (Pickers Ideal − Pickers Constrained) × throughput / UPO<br>"

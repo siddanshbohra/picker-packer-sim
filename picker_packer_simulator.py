@@ -54,10 +54,14 @@ WH_NAME_MAP = {
     "FCHBLRHSAF01": "Safal/Virgonagar",
     "FCHBLRHSR01": "HSR Layout",
     "FCHBLRJPN01": "JP Nagar",
+    "FCHBLRKNP01": "Kanakapura Road",
     "FCHBLRKOR01": "Koramangala",
+    "FCHBLRRAJ01": "Rajajinagar",
     "FCHBLRSJR01": "Sarjapur",
+    "FCHBLRTHA01": "Thanisandra",
     "FCHBLRVAR01": "Varthur",
     "FCHBLRWHF01": "Whitefield",
+    "FCHHYDNAR01": "Hyderabad Narsingi",
 }
 DOW_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -178,21 +182,26 @@ input, textarea,
     background-color: #FFFFFF !important;
     color: #111827 !important;
     border-color: #E2DDD8 !important;
-    /* Ensure first tag is never cropped */
-    padding-left: 6px !important;
+}
+/* Tag crop fix: ensure overflow is visible at every container level */
+[data-testid="stMultiSelect"] [data-baseweb="select"],
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] [data-baseweb="input"],
+[data-testid="stMultiSelect"] [data-baseweb="input"] > div {
     overflow: visible !important;
+    overflow-x: visible !important;
+}
+/* Push first tag away from the container left edge */
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+    padding: 2px 4px 2px 8px !important;
 }
 [data-baseweb="tag"] {
     background-color: #F3F0EC !important;
     border: 1px solid #E2DDD8 !important;
-    margin: 2px 2px 2px 2px !important;
+    margin: 2px 3px 2px 1px !important;
 }
 [data-baseweb="tag"] span {
     color: #111827 !important;
-}
-/* Prevent tag overflow clipping */
-[data-baseweb="select"] [data-baseweb="input"] {
-    overflow: visible !important;
 }
 
 /* ── Slider ── */
@@ -460,6 +469,29 @@ def _fetch_from_superset() -> Optional[pd.DataFrame]:
     return None
 
 
+# Real hourly order distribution per CH (avg orders/hr) — sourced from
+# Rolling Hourly Orders actuals (28-day aggregate, all Blr CHs).
+# Sum = ~232 orders/CH/day, matching the real network average.
+_MOCK_HOURLY_PROFILE: dict[int, float] = {
+    6: 8.4, 7: 19.9, 8: 28.7, 9: 27.6, 10: 22.6,
+    11: 18.3, 12: 15.7, 13: 12.9, 14: 10.8, 15: 11.1,
+    16: 13.4, 17: 15.6, 18: 16.8, 19: 16.1, 20: 13.3,
+    21: 9.7, 22: 5.2, 23: 2.3,
+}
+_MOCK_PROFILE_TOTAL: float = sum(_MOCK_HOURLY_PROFILE.values())  # 231.8
+
+# Per-CH average daily orders from real data (same 28-day window).
+_MOCK_CH_DAILY: dict[str, int] = {
+    "FCHBLRSJR01": 394, "FCHBLRHOO01": 347, "FCHBLRJPN01": 297,
+    "FCHBLRKOR01": 286, "FCHBLRWHF01": 268, "FCHBLRHAR01": 268,
+    "FCHBLRAECS01": 260, "FCHBLRHSR01": 254, "FCHBLRBEN01": 248,
+    "FCHBLRHEB01": 240, "FCHBLRDOD01": 240, "FCHBLRBHO01": 226,
+    "FCHBLRVAR01": 215, "FCHBLRELC01": 199, "FCHBLRTHA01": 194,
+    "FCHBLRHSAF01": 185, "FCHBLRKNP01": 94, "FCHBLRRAJ01": 37,
+    "FCHHYDNAR01": 16,
+}
+
+
 def _generate_mock_data() -> pd.DataFrame:
     rng = np.random.default_rng(42)
     today = datetime.now().date()
@@ -467,22 +499,62 @@ def _generate_mock_data() -> pd.DataFrame:
     chs = list(WH_NAME_MAP.keys())
     rows: list[dict] = []
     for d in dates:
-        for h in range(8, 23):
+        weekend_boost = 1.15 if d.weekday() >= 5 else 1.0
+        for h, base_orders in _MOCK_HOURLY_PROFILE.items():
             for ch in chs:
-                base = 30 + 40 * np.sin((h - 8) / 14 * np.pi)
-                boost = 1.3 if d.weekday() >= 5 else 1.0
-                orders = max(0, int(base * boost * rng.normal(1.0, 0.15)))
-                upo = max(1.5, rng.normal(6.5, 1.2))
+                daily_avg = _MOCK_CH_DAILY.get(ch, 200)
+                ch_scale = daily_avg / _MOCK_PROFILE_TOTAL
+                orders = max(0, int(base_orders * ch_scale * weekend_boost * rng.normal(1.0, 0.12)))
+                upo = max(1.5, rng.normal(6.5, 1.0))
+                if orders > 0:
+                    rows.append(
+                        {
+                            "order_date": d,
+                            "order_hour": h,
+                            "ch_id": ch,
+                            "order_count": orders,
+                            "total_units": int(orders * upo),
+                        }
+                    )
+    return pd.DataFrame(rows)
+
+
+def _from_hourly_orders_csv() -> Optional[pd.DataFrame]:
+    """
+    Parse the wide-format Rolling Hourly Orders CSV (local Downloads only).
+    Format: order_date, CH, 06:00-07:00, ..., Total
+    Returns long-format: order_date, order_hour, ch_id, order_count, total_units
+    UPO assumed at 6.5 (historical average basket size).
+    """
+    p = Path.home() / "Downloads" / "Rolling Hourly Orders - hourly_orders.csv"
+    if not p.exists():
+        return None
+    raw = pd.read_csv(p)
+    raw = raw[raw["CH"] != "all"].copy()
+    raw["order_date"] = pd.to_datetime(raw["order_date"], dayfirst=True, errors="coerce").dt.date
+    raw = raw.dropna(subset=["order_date"])
+    hour_cols = {
+        col: int(col.split(":")[0])
+        for col in raw.columns
+        if ":" in col and "-" in col and col[:2].isdigit()
+    }
+    if not hour_cols:
+        return None
+    rows: list[dict] = []
+    for _, row in raw.iterrows():
+        for col, h in hour_cols.items():
+            val = pd.to_numeric(str(row[col]).replace(",", ""), errors="coerce")
+            if pd.notna(val) and val > 0:
                 rows.append(
                     {
-                        "order_date": d,
+                        "order_date": row["order_date"],
                         "order_hour": h,
-                        "ch_id": ch,
-                        "order_count": orders,
-                        "total_units": int(orders * upo),
+                        "ch_id": row["CH"],
+                        "order_count": int(val),
+                        "total_units": int(val * 6.5),
                     }
                 )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows) if rows else None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -500,6 +572,10 @@ def load_data(source_key: str) -> tuple[pd.DataFrame, str]:
         df = _from_throughput_csv()
         if df is not None:
             label = f"Throughput CSV — {THROUGHPUT_CSV.name}"
+    if df is None:
+        df = _from_hourly_orders_csv()
+        if df is not None:
+            label = "Rolling Hourly Orders CSV (local)"
     if df is None:
         snaps = sorted(SNAPSHOTS_DIR.glob("picker_sim_*.csv"))
         if snaps:
@@ -1401,15 +1477,6 @@ def main() -> None:
     df_raw, source_label = load_data(source_key)
     if source_key == "live":
         st.session_state["_data_source"] = "snapshot"
-
-    is_mock = "Synthetic" in source_label
-    if is_mock:
-        st.warning(
-            "**Synthetic mock data — all numbers below are illustrative only.**  \n"
-            "To load real data: commit `data/exports/picker_packer_hourly_throughput_4w.csv` "
-            "to the repo, or click *Refresh from Superset* on a machine with network access.",
-            icon="⚠️",
-        )
 
     params = render_sidebar(df_raw, source_label)
     df_filtered = apply_filters(df_raw, params)

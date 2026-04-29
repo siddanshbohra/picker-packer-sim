@@ -495,7 +495,7 @@ _MOCK_CH_DAILY: dict[str, int] = {
 def _generate_mock_data() -> pd.DataFrame:
     rng = np.random.default_rng(42)
     today = datetime.now().date()
-    dates = [today - timedelta(days=i) for i in range(1, 29)]
+    dates = [today - timedelta(days=i) for i in range(1, 61)]
     chs = list(WH_NAME_MAP.keys())
     rows: list[dict] = []
     for d in dates:
@@ -521,13 +521,18 @@ def _generate_mock_data() -> pd.DataFrame:
 
 def _from_hourly_orders_csv() -> Optional[pd.DataFrame]:
     """
-    Parse the wide-format Rolling Hourly Orders CSV (local Downloads only).
+    Parse the wide-format Rolling Hourly Orders CSV.
+    Checks repo data/reference/ first (works on cloud), then local Downloads.
     Format: order_date, CH, 06:00-07:00, ..., Total
     Returns long-format: order_date, order_hour, ch_id, order_count, total_units
     UPO assumed at 6.5 (historical average basket size).
     """
-    p = Path.home() / "Downloads" / "Rolling Hourly Orders - hourly_orders.csv"
-    if not p.exists():
+    candidates = [
+        REPO_ROOT / "data" / "reference" / "hourly_orders.csv",
+        Path.home() / "Downloads" / "Rolling Hourly Orders - hourly_orders.csv",
+    ]
+    p = next((c for c in candidates if c.exists()), None)
+    if p is None:
         return None
     raw = pd.read_csv(p)
     raw = raw[raw["CH"] != "all"].copy()
@@ -679,6 +684,95 @@ def project_hourly_demand(
             "projected_units_in_hour",
         ]
     ].rename(columns={"event_hour": "hour"})
+
+
+# ─── FORWARD PLAN HELPERS (v2 — upload-based) ─────────────────────────────────
+def derive_hourly_shares(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Derive per-CH hourly share of daily orders and average UPO from loaded data.
+    Returns:
+        share_df: DataFrame(ch_id, order_hour, share)  — share sums to 1.0 per CH
+        ch_upo: Series(ch_id -> avg units_per_order)
+    """
+    df = df[df["order_count"] > 0].copy()
+    agg = df.groupby(["ch_id", "order_hour"])["order_count"].sum().reset_index()
+    ch_total = agg.groupby("ch_id")["order_count"].transform("sum")
+    agg["share"] = np.where(ch_total > 0, agg["order_count"] / ch_total, 0.0)
+    ch_upo = df.groupby("ch_id").apply(
+        lambda g: g["total_units"].sum() / max(g["order_count"].sum(), 1)
+    )
+    return agg[["ch_id", "order_hour", "share"]], ch_upo
+
+
+def parse_projection_upload(file_obj) -> Optional[pd.DataFrame]:
+    """
+    Parse user-uploaded order projection CSV.
+    Accepts:
+      - Long format: date, ch_id, projected_orders
+      - Pivot format: date, FCH..., FCH..., ...  (CH codes as column headers)
+    Returns long format: date (date), ch_id (str), projected_orders (int)
+    """
+    raw = pd.read_csv(file_obj)
+    raw.columns = [str(c).strip() for c in raw.columns]
+
+    if "ch_id" in raw.columns and "projected_orders" in raw.columns:
+        out = raw[["date", "ch_id", "projected_orders"]].copy()
+    elif any(c.startswith("FC") for c in raw.columns):
+        ch_cols = [c for c in raw.columns if c.startswith("FC")]
+        date_col = next((c for c in raw.columns if "date" in c.lower()), raw.columns[0])
+        out = (
+            raw[[date_col] + ch_cols]
+            .melt(id_vars=date_col, var_name="ch_id", value_name="projected_orders")
+            .rename(columns={date_col: "date"})
+        )
+    else:
+        return None
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date
+    out["projected_orders"] = (
+        out["projected_orders"].astype(str).str.replace(",", "").str.strip()
+        .replace({"": None, "nan": None, "None": None})
+    )
+    out["projected_orders"] = pd.to_numeric(out["projected_orders"], errors="coerce")
+    out = out.dropna(subset=["date", "projected_orders"])
+    out["projected_orders"] = out["projected_orders"].astype(int)
+    return out if not out.empty else None
+
+
+def project_from_upload(
+    opd_long: pd.DataFrame,
+    hourly_share: pd.DataFrame,
+    ch_upo: pd.Series,
+    selected_dates: list,
+    selected_chs: list,
+) -> pd.DataFrame:
+    """
+    Apply per-CH hourly shares to daily projected orders.
+    Returns a row per (date, ch_id, hour) with projected demand and units.
+    """
+    f = opd_long[
+        opd_long["date"].isin(selected_dates) & opd_long["ch_id"].isin(selected_chs)
+    ].copy()
+    if f.empty:
+        return pd.DataFrame()
+    upo_df = ch_upo.reset_index()
+    upo_df.columns = ["ch_id", "upo"]
+    share = hourly_share.rename(columns={"order_hour": "hour"})
+    plan = (
+        f.merge(share, on="ch_id", how="left")
+         .merge(upo_df, on="ch_id", how="left")
+    )
+    plan["upo"] = plan["upo"].fillna(6.5)
+    # Fallback share if CH not in historical data: uniform across 18 hours
+    plan["share"] = plan["share"].fillna(1.0 / 18)
+    plan["projected_orders_in_hour"] = (plan["projected_orders"] * plan["share"]).round(1)
+    plan["projected_units_in_hour"] = (plan["projected_orders_in_hour"] * plan["upo"]).round(0)
+    return plan[
+        ["date", "ch_id", "hour", "projected_orders", "share", "upo",
+         "projected_orders_in_hour", "projected_units_in_hour"]
+    ]
 
 
 # ─── CALCULATION ENGINE ───────────────────────────────────────────────────────
@@ -1221,60 +1315,99 @@ def render_tab_raw(df: pd.DataFrame, params: dict) -> None:
 
 
 # ─── TAB 3: FORWARD PLAN ──────────────────────────────────────────────────────
-def render_tab_forward(params: dict) -> None:
+def render_tab_forward(params: dict, df_raw: pd.DataFrame) -> None:
     st.markdown(
         '<p style="font-size:12px;color:#6B7280;margin:0 0 16px 0;">'
-        "Forward-looking headcount derived from OPD daily projections "
-        "× historical hourly demand share per CH."
+        "Upload CH-level daily order projections to get an hourly manpower plan. "
+        "Hourly distribution is derived from your loaded historical data."
         "</p>",
         unsafe_allow_html=True,
     )
 
-    baseline = load_throughput_baseline()
-    if baseline is None:
+    if df_raw.empty:
+        st.error("No historical data loaded. Cannot derive hourly distribution.")
+        return
+
+    hourly_share, ch_upo = derive_hourly_shares(df_raw)
+
+    # ── Template download ──────────────────────────────────────────────────────
+    today = datetime.now().date()
+    template_rows = [
+        {
+            "date": (today + timedelta(days=i + 1)).strftime("%Y-%m-%d"),
+            "ch_id": ch_id,
+            "projected_orders": _MOCK_CH_DAILY.get(ch_id, 200),
+        }
+        for i in range(7)
+        for ch_id in WH_NAME_MAP
+    ]
+    template_csv = pd.DataFrame(template_rows).to_csv(index=False).encode("utf-8")
+
+    c1, c2 = st.columns([2, 5])
+    with c1:
+        st.download_button(
+            "Download projection template",
+            data=template_csv,
+            file_name=f"order_projection_template_{today}.csv",
+            mime="text/csv",
+            help="Pre-filled with next 7 days × all CHs. Edit and re-upload.",
+        )
+
+    # ── File uploader ──────────────────────────────────────────────────────────
+    uploaded = st.file_uploader(
+        "Upload order projections CSV",
+        type="csv",
+        help=(
+            "Required columns: date (YYYY-MM-DD or DD/MM/YYYY), ch_id, projected_orders.  \n"
+            "Also accepts pivot format with CH codes (FCH...) as column headers."
+        ),
+    )
+    if uploaded is None:
+        st.info("Upload a CSV to generate the manpower plan. Use the template above as a starting point.")
+        return
+
+    opd = parse_projection_upload(uploaded)
+    if opd is None or opd.empty:
         st.error(
-            "Historical baseline not found. "
-            "Run `fetch_throughput.py` locally to generate `data/exports/picker_packer_hourly_throughput_4w.csv`, "
-            "then commit it to the repo to enable this tab."
+            "Could not parse the uploaded file.  \n"
+            "Expected columns: `date`, `ch_id`, `projected_orders`.  \n"
+            "Download the template above to see the correct format."
         )
         return
 
-    opd_path = st.text_input(
-        "OPD projections CSV path",
-        value=str(DEFAULT_OPD_PATH),
-        help="Daily order projections per CH.",
+    # ── Projection scope selectors ─────────────────────────────────────────────
+    available_dates = sorted(opd["date"].unique())
+    available_chs = sorted(
+        set(opd["ch_id"].unique()) & set(hourly_share["ch_id"].unique())
     )
-    opd = load_opd_projections(opd_path)
-    if opd is None or opd.empty:
-        st.error(f"Could not load OPD projections from `{opd_path}`.")
+    missing_chs = sorted(set(opd["ch_id"].unique()) - set(hourly_share["ch_id"].unique()))
+    if missing_chs:
+        st.caption(
+            f"CHs with no historical data (excluded): {', '.join(missing_chs)}"
+        )
+    if not available_chs:
+        st.warning("None of the CHs in your upload have historical data. Cannot project.")
         return
 
-    today = datetime.now().date()
-    available_dates = sorted([d for d in opd["date"].unique() if d >= today])
-    if not available_dates:
-        available_dates = sorted(opd["date"].unique())[-2:]
-    default_dates = available_dates[:2] if len(available_dates) >= 2 else available_dates
+    col_d, col_c = st.columns([3, 2])
+    with col_d:
+        sel_dates = st.multiselect(
+            "Dates to project",
+            available_dates,
+            default=available_dates[:min(5, len(available_dates))],
+            format_func=lambda d: d.strftime("%a %d %b %Y") if hasattr(d, "strftime") else str(d),
+        )
+    with col_c:
+        sel_chs = st.multiselect("CHs to include", available_chs, default=available_chs)
 
-    sel_dates = st.multiselect(
-        "Project for date(s)",
-        sorted(opd["date"].unique()),
-        default=default_dates,
-        format_func=lambda d: d.strftime("%a %d %b %Y"),
-    )
-    if not sel_dates:
-        st.info("Pick at least one projection date.")
+    if not sel_dates or not sel_chs:
+        st.info("Select at least one date and one CH.")
         return
 
-    available_chs = sorted(set(opd["ch_id"].unique()) & set(baseline["ch_id"].unique()))
-    sel_chs = st.multiselect("CHs to project", available_chs, default=available_chs)
-    if not sel_chs:
-        st.info("Pick at least one CH.")
-        return
-
-    hourly_share, ch_upo = derive_per_ch_baseline(baseline)
-    plan = project_hourly_demand(opd, hourly_share, ch_upo, sel_dates, sel_chs)
+    # ── Build plan ─────────────────────────────────────────────────────────────
+    plan = project_from_upload(opd, hourly_share, ch_upo, sel_dates, sel_chs)
     if plan.empty:
-        st.warning("No projection rows — check baseline coverage for selected CHs.")
+        st.warning("No projection rows — check that uploaded CH codes match historical data.")
         return
 
     raw_pick = plan["projected_units_in_hour"] / max(params["picker_throughput"], 1e-6)
@@ -1448,10 +1581,10 @@ def render_tab_forward(params: dict) -> None:
         height=360,
     )
 
-    csv = plan.assign(date=plan["date"].astype(str)).to_csv(index=False).encode("utf-8")
+    csv_out = plan.assign(date=plan["date"].astype(str)).to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download forward plan (CSV)",
-        data=csv,
+        data=csv_out,
         file_name=f"forward_plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
     )
@@ -1500,7 +1633,7 @@ def main() -> None:
     with tab2:
         render_tab_raw(df_computed, params)
     with tab3:
-        render_tab_forward(params)
+        render_tab_forward(params, df_raw)
 
     st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
     st.caption(

@@ -1116,15 +1116,18 @@ def render_kpis(df: pd.DataFrame, params: dict) -> None:
     pick_breach_pct = 100 * total_pick_breach / max(total_orders, 1)
     pack_breach_pct = 100 * total_pack_breach / max(total_orders, 1)
 
+    # Distinct headcount, cost, and CPO are always derived from the modeled
+    # constrained plan (pickers_required / packers_required) so they reflect
+    # what the simulator recommends — not the observed audit-event counts.
     distinct_pickers_avg, _ = compute_distinct_two_shift(
         df,
-        role_col=picker_count_col,
+        role_col="pickers_required",
         shift_hours=params["picker_shift_hours"],
         hour_range=params["hour_range"],
     )
     distinct_packers_avg, _ = compute_distinct_two_shift(
         df,
-        role_col=packer_count_col,
+        role_col="packers_required",
         shift_hours=params["packer_shift_hours"],
         hour_range=params["hour_range"],
     )
@@ -1148,12 +1151,12 @@ def render_kpis(df: pd.DataFrame, params: dict) -> None:
         kpi_card(
             f"Distinct Pickers / Day",
             str(distinct_pickers),
-            f"{count_source}; 2 shifts × {params['picker_shift_hours']}h",
+            f"Modeled constrained; 2 shifts × {params['picker_shift_hours']}h",
         ),
         kpi_card(
             f"Distinct Packers / Day",
             str(distinct_packers),
-            f"{count_source}; 2 shifts × {params['packer_shift_hours']}h",
+            f"Modeled constrained; 2 shifts × {params['packer_shift_hours']}h",
         ),
     ]
     for col, card in zip(c, cards_row1):
@@ -1206,12 +1209,7 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
 
     st.markdown(
         '<p style="font-size:12px;color:#6B7280;margin:0 0 16px 0;">'
-        + (
-            "<b style='color:#374151;'>Actual</b> (solid) — active users from Superset audit logs. "
-            if has_actual_counts
-            else ""
-        )
-        + "<b style='color:#374151;'>Constrained</b> (solid) — headcount deployable under the CH cap. "
+        "<b style='color:#374151;'>Constrained</b> (solid) — headcount deployable under the CH cap. "
         "<b style='color:#374151;'>Ideal</b> (dashed) — headcount needed with no cap. "
         "Shaded area = understaffing exposure."
         "</p>",
@@ -1225,9 +1223,6 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
         "packers_ideal": ("packers_uncapped", "mean"),
         "units": ("total_units", "mean"),
     }
-    if has_actual_counts:
-        hourly_aggs["actual_pickers"] = ("actual_pickers", "mean")
-        hourly_aggs["actual_packers"] = ("actual_packers", "mean")
 
     by_hour = (
         df.groupby("order_hour")
@@ -1295,7 +1290,7 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
             y=by_hour["pickers_required"],
             name="Pickers — modeled constrained",
             mode="lines+markers",
-            line=dict(color="#9CA3AF" if has_actual_counts else "#111111", width=2.5),
+            line=dict(color="#111111", width=2.5),
             marker=dict(size=5, color="#111111"),
             hovertemplate="Pickers modeled constrained: %{y:.1f}<extra></extra>",
         )
@@ -1306,35 +1301,11 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
             y=by_hour["packers_required"],
             name="Packers — modeled constrained",
             mode="lines+markers",
-            line=dict(color="#C4B5FD" if has_actual_counts else "#8B5CF6", width=2.5),
+            line=dict(color="#8B5CF6", width=2.5),
             marker=dict(size=5, color="#8B5CF6"),
             hovertemplate="Packers modeled constrained: %{y:.1f}<extra></extra>",
         )
     )
-
-    if has_actual_counts:
-        fig.add_trace(
-            go.Scatter(
-                x=by_hour["order_hour"],
-                y=by_hour["actual_pickers"],
-                name="Pickers — actual",
-                mode="lines+markers",
-                line=dict(color="#111111", width=3),
-                marker=dict(size=6, color="#111111"),
-                hovertemplate="Pickers actual: %{y:.1f}<extra></extra>",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=by_hour["order_hour"],
-                y=by_hour["actual_packers"],
-                name="Packers — actual",
-                mode="lines+markers",
-                line=dict(color="#8B5CF6", width=3),
-                marker=dict(size=6, color="#8B5CF6"),
-                hovertemplate="Packers actual: %{y:.1f}<extra></extra>",
-            )
-        )
 
     # Units on secondary axis
     fig.add_trace(

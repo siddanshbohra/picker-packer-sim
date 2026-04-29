@@ -116,12 +116,16 @@ html, body,
 }
 
 /* ── Sidebar — Paper filter pane ── */
-section[data-testid="stSidebar"],
+/* Apply border-right only to the outermost sidebar element to avoid stacking borders */
+section[data-testid="stSidebar"] {
+    background-color: #FFFFFF !important;
+    border-right: 1px solid #E2DDD8 !important;
+}
 section[data-testid="stSidebar"] > div,
 section[data-testid="stSidebar"] > div > div,
 [data-testid="stSidebarContent"] {
     background-color: #FFFFFF !important;
-    border-right: 1px solid #E2DDD8 !important;
+    border-right: none !important;
 }
 
 /* Sidebar text — target specific text nodes only, NOT * (breaks Streamlit icon fonts) */
@@ -170,19 +174,25 @@ input, textarea,
 }
 
 /* ── Select / Multiselect ── */
-[data-baseweb="select"] > div,
-[data-baseweb="select"] [data-baseweb="popover"],
-[data-baseweb="tag"] {
+[data-baseweb="select"] > div {
     background-color: #FFFFFF !important;
     color: #111827 !important;
     border-color: #E2DDD8 !important;
+    /* Ensure first tag is never cropped */
+    padding-left: 6px !important;
+    overflow: visible !important;
 }
 [data-baseweb="tag"] {
     background-color: #F3F0EC !important;
     border: 1px solid #E2DDD8 !important;
+    margin: 2px 2px 2px 2px !important;
 }
 [data-baseweb="tag"] span {
     color: #111827 !important;
+}
+/* Prevent tag overflow clipping */
+[data-baseweb="select"] [data-baseweb="input"] {
+    overflow: visible !important;
 }
 
 /* ── Slider ── */
@@ -694,13 +704,22 @@ def render_sidebar(df: pd.DataFrame, source_label: str) -> dict:
     # Header
     st.sidebar.markdown("**Manpower Simulator**")
     st.sidebar.caption(source_label)
-    if st.sidebar.button("Refresh from Superset", use_container_width=True):
-        load_data.clear()
-        st.session_state["_data_source"] = "live"
-        st.rerun()
-    err = st.session_state.get("_fetch_error")
-    if err:
-        st.sidebar.warning(err)
+
+    is_using_mock = "Synthetic" in source_label
+    if is_using_mock:
+        st.sidebar.info(
+            "Running on synthetic data. "
+            "Superset is only reachable on the internal network.",
+            icon="ℹ️",
+        )
+    else:
+        if st.sidebar.button("Refresh from Superset", use_container_width=True):
+            load_data.clear()
+            st.session_state["_data_source"] = "live"
+            st.rerun()
+        err = st.session_state.get("_fetch_error")
+        if err:
+            st.sidebar.warning(err)
 
     st.sidebar.divider()
 

@@ -124,38 +124,38 @@ section[data-testid="stSidebar"] > div > div,
     border-right: 1px solid #E2DDD8 !important;
 }
 
-section[data-testid="stSidebar"] * {
-    color: #111827 !important;
-    font-family: 'Roboto', sans-serif !important;
-}
-
-/* Sidebar filter group header */
-section[data-testid="stSidebar"] .stMarkdown p {
-    font-size: 0.70rem !important;
-    font-weight: 700 !important;
-    letter-spacing: 0.10em !important;
-    text-transform: uppercase !important;
-    color: #9CA3AF !important;
-    margin: 14px 0 6px 0 !important;
-}
-
-/* Sidebar strong labels */
-section[data-testid="stSidebar"] strong {
-    font-size: 0.80rem !important;
-    font-weight: 600 !important;
-    color: #374151 !important;
-    letter-spacing: 0.01em !important;
-}
-
-/* Sidebar labels on inputs */
+/* Sidebar text — target specific text nodes only, NOT * (breaks Streamlit icon fonts) */
+section[data-testid="stSidebar"] p,
 section[data-testid="stSidebar"] label,
-section[data-testid="stSidebar"] [data-testid="stWidgetLabel"],
+section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+section[data-testid="stSidebar"] .stMarkdown p,
+section[data-testid="stSidebar"] strong,
+section[data-testid="stSidebar"] small {
+    font-family: 'Roboto', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    color: #111827 !important;
+}
+
+section[data-testid="stSidebar"] label,
 section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
     font-size: 0.76rem !important;
     font-weight: 500 !important;
     color: #374151 !important;
     letter-spacing: 0 !important;
     text-transform: none !important;
+}
+
+section[data-testid="stSidebar"] strong {
+    font-size: 0.80rem !important;
+    font-weight: 600 !important;
+    color: #374151 !important;
+}
+
+/* Expander label text only — leave SVG/icon spans alone */
+section[data-testid="stSidebar"] details > summary p {
+    font-family: 'Roboto', sans-serif !important;
+    font-size: 0.81rem !important;
+    font-weight: 500 !important;
+    color: #374151 !important;
 }
 
 /* ── All inputs light ── */

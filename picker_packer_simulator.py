@@ -190,15 +190,16 @@ input, textarea,
    - Pad the ValueContainer (data-baseweb="input") directly — that's where tags live
    - Increase tag left margin so first tag never abuts the left clip edge */
 [data-testid="stMultiSelect"] [data-baseweb="input"] {
-    padding-left: 6px !important;
+    padding-left: 12px !important;
     overflow: visible !important;
 }
-[data-baseweb="tag"] {
+[data-testid="stMultiSelect"] [data-baseweb="tag"] {
     background-color: #F3F0EC !important;
     border: 1px solid #E2DDD8 !important;
-    margin: 2px 3px 2px 4px !important;
+    margin: 2px 3px 2px 8px !important;
+    overflow: visible !important;
 }
-[data-baseweb="tag"] span {
+[data-testid="stMultiSelect"] [data-baseweb="tag"] span {
     color: #111827 !important;
 }
 

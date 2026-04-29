@@ -183,22 +183,17 @@ input, textarea,
     color: #111827 !important;
     border-color: #E2DDD8 !important;
 }
-/* Tag crop fix: ensure overflow is visible at every container level */
-[data-testid="stMultiSelect"] [data-baseweb="select"],
-[data-testid="stMultiSelect"] [data-baseweb="select"] > div,
-[data-testid="stMultiSelect"] [data-baseweb="input"],
-[data-testid="stMultiSelect"] [data-baseweb="input"] > div {
+/* Tag crop fix:
+   - Pad the ValueContainer (data-baseweb="input") directly — that's where tags live
+   - Increase tag left margin so first tag never abuts the left clip edge */
+[data-testid="stMultiSelect"] [data-baseweb="input"] {
+    padding-left: 6px !important;
     overflow: visible !important;
-    overflow-x: visible !important;
-}
-/* Push first tag away from the container left edge */
-[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
-    padding: 2px 4px 2px 8px !important;
 }
 [data-baseweb="tag"] {
     background-color: #F3F0EC !important;
     border: 1px solid #E2DDD8 !important;
-    margin: 2px 3px 2px 1px !important;
+    margin: 2px 3px 2px 4px !important;
 }
 [data-baseweb="tag"] span {
     color: #111827 !important;
@@ -876,13 +871,7 @@ def render_sidebar(df: pd.DataFrame, source_label: str) -> dict:
     st.sidebar.caption(source_label)
 
     is_using_mock = "Synthetic" in source_label
-    if is_using_mock:
-        st.sidebar.info(
-            "Running on synthetic data. "
-            "Superset is only reachable on the internal network.",
-            icon="ℹ️",
-        )
-    else:
+    if not is_using_mock:
         if st.sidebar.button("Refresh from Superset", use_container_width=True):
             load_data.clear()
             st.session_state["_data_source"] = "live"

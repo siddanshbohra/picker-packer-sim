@@ -25,6 +25,27 @@ EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_SUPPLY = 2
 
+# Source-of-truth orders/units at fo.created_at grain. Aligns with the Ops
+# Rolling Hourly Orders CSV which is built from the same definition.
+CREATED_SQL = """
+SELECT DATE(fo.created_at)                      AS event_date,
+       HOUR(fo.created_at)                      AS event_hour,
+       fo.warehouse_id                          AS ch_id,
+       COUNT(DISTINCT fo.id)                    AS orders_created,
+       SUM(COALESCE(foi.requested_quantity, 0)) AS units_requested
+FROM inventory.fulfilment_orders fo
+INNER JOIN inventory.fulfilment_order_item foi ON foi.fulfilment_order_id = fo.id
+WHERE fo.created_at >= DATE_SUB(CURDATE(), INTERVAL 28 DAY)
+  AND fo.warehouse_id LIKE 'FC%'
+  AND fo.id NOT LIKE 'SB%'
+  AND fo.id NOT LIKE 'SL%'
+  AND fo.processing_status NOT IN (
+      'CANCELLED','ALLOCATION_FAILED','PACKING_FAILED','HANDOVER_FAILED'
+  )
+GROUP BY DATE(fo.created_at), HOUR(fo.created_at), fo.warehouse_id
+ORDER BY event_date DESC, event_hour, ch_id
+"""
+
 PICKER_SQL = """
 SELECT DATE(a.created_at) AS event_date,
        HOUR(a.created_at) AS event_hour,
@@ -91,6 +112,10 @@ def main() -> None:
     )
     auth = client.authenticate()
 
+    print("Fetching created-at hourly orders/units (4 weeks)...")
+    created = fetch(client, auth, CREATED_SQL)
+    print(f"  rows: {len(created)}")
+
     print("Fetching picker hourly throughput (4 weeks)...")
     pickers = fetch(client, auth, PICKER_SQL)
     print(f"  rows: {len(pickers)}")
@@ -103,9 +128,15 @@ def main() -> None:
         pickers, packers,
         on=["event_date", "event_hour", "ch_id"],
         how="outer",
+    )
+    merged = pd.merge(
+        created, merged,
+        on=["event_date", "event_hour", "ch_id"],
+        how="outer",
     ).fillna(0)
 
-    for col in ["active_pickers", "orders_picked", "units_picked",
+    for col in ["orders_created", "units_requested",
+                "active_pickers", "orders_picked", "units_picked",
                 "active_packers", "orders_packed", "units_packed",
                 "event_hour"]:
         merged[col] = merged[col].astype(int)

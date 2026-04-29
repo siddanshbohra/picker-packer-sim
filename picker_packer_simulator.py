@@ -423,6 +423,12 @@ def kpi_card(
 
 # ─── DATA FETCH ───────────────────────────────────────────────────────────────
 def _from_throughput_csv() -> Optional[pd.DataFrame]:
+    """
+    Source of truth: Superset throughput export.
+    Order/unit volume is at fo.created_at hour grain so it aligns with the
+    Rolling Hourly Orders CSV.  Manpower (active_pickers/packers) is at the
+    PICKED/PACKED audit-event hour grain.
+    """
     source_path = next(
         (p for p in [THROUGHPUT_CSV, LOCAL_THROUGHPUT_CSV, REFERENCE_THROUGHPUT_CSV] if p.exists()),
         None,
@@ -430,24 +436,38 @@ def _from_throughput_csv() -> Optional[pd.DataFrame]:
     if source_path is None:
         return None
     df = pd.read_csv(source_path)
+
+    # Prefer created-at columns; fall back to picked-event columns for old exports.
+    if "orders_created" in df.columns:
+        order_col = "orders_created"
+    else:
+        order_col = "orders_picked"
+    if "units_requested" in df.columns:
+        unit_col = "units_requested"
+    else:
+        unit_col = "units_picked"
+
     out = pd.DataFrame(
         {
             "order_date": pd.to_datetime(df["event_date"]).dt.date,
             "order_hour": df["event_hour"].astype(int),
             "ch_id": df["ch_id"],
-            "order_count": df["orders_picked"].fillna(0).astype(int),
-            "total_units": df["units_picked"].fillna(0).astype(int),
+            "order_count": pd.to_numeric(df[order_col], errors="coerce").fillna(0).astype(int),
+            "total_units": pd.to_numeric(df[unit_col], errors="coerce").fillna(0).astype(int),
         }
     )
+
     optional_cols = {
         "active_pickers": "actual_pickers",
         "active_packers": "actual_packers",
+        "orders_picked": "orders_picked",
         "orders_packed": "orders_packed",
+        "units_picked": "units_picked",
         "units_packed": "units_packed",
     }
     for source_col, target_col in optional_cols.items():
         if source_col in df.columns:
-            out[target_col] = df[source_col].fillna(0).astype(int)
+            out[target_col] = pd.to_numeric(df[source_col], errors="coerce").fillna(0).astype(int)
     return out[out["order_count"] > 0].reset_index(drop=True)
 
 
@@ -574,39 +594,34 @@ def _from_hourly_orders_csv() -> Optional[pd.DataFrame]:
     return pd.DataFrame(rows) if rows else None
 
 
-def _merge_hourly_with_throughput(
-    hourly_df: pd.DataFrame, throughput_df: Optional[pd.DataFrame]
-) -> pd.DataFrame:
+def _verification_delta(
+    superset_df: pd.DataFrame, csv_df: Optional[pd.DataFrame]
+) -> Optional[dict]:
     """
-    Make rolling hourly CSV the source of truth for order_count and overlay
-    manpower/packed metrics from throughput when available.
+    Compare Superset (source of truth) daily order totals to Rolling Hourly
+    Orders CSV and return reconciliation stats. Used as a sanity check banner.
     """
-    out = hourly_df.copy()
-    if throughput_df is None or throughput_df.empty:
-        return out
-
-    right_cols = [
-        "order_date",
-        "order_hour",
-        "ch_id",
-        "actual_pickers",
-        "actual_packers",
-        "orders_packed",
-        "units_packed",
-        "total_units",
-    ]
-    r = throughput_df[right_cols].rename(columns={"total_units": "units_picked"})
-    merged = out.merge(r, on=["order_date", "order_hour", "ch_id"], how="left")
-
-    # Preserve CSV order_count, but use observed units where present.
-    merged["total_units"] = np.where(
-        merged["units_picked"].notna(),
-        merged["units_picked"],
-        merged["total_units"],
+    if csv_df is None or csv_df.empty or superset_df.empty:
+        return None
+    sup_day = (
+        superset_df.groupby(["order_date", "ch_id"], as_index=False)["order_count"].sum()
     )
-    merged["total_units"] = pd.to_numeric(merged["total_units"], errors="coerce").fillna(0).astype(int)
-    merged = merged.drop(columns=["units_picked"])
-    return merged
+    csv_day = (
+        csv_df.groupby(["order_date", "ch_id"], as_index=False)["order_count"].sum()
+        .rename(columns={"order_count": "csv_orders"})
+    )
+    merged = sup_day.merge(csv_day, on=["order_date", "ch_id"], how="inner")
+    if merged.empty:
+        return None
+    merged["delta"] = merged["order_count"] - merged["csv_orders"]
+    return {
+        "rows": int(len(merged)),
+        "days": int(merged["order_date"].nunique()),
+        "mean_abs_delta": float(merged["delta"].abs().mean()),
+        "max_abs_delta": int(merged["delta"].abs().max()),
+        "p95_abs_delta": float(merged["delta"].abs().quantile(0.95)),
+        "latest_date": str(merged["order_date"].max()),
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -623,17 +638,23 @@ def load_data(source_key: str) -> tuple[pd.DataFrame, str]:
     throughput_df = _from_throughput_csv()
     hourly_orders_df = _from_hourly_orders_csv()
 
-    if df is None and hourly_orders_df is not None:
-        df = _merge_hourly_with_throughput(hourly_orders_df, throughput_df)
-        label = "Rolling Hourly Orders CSV (source of truth) + throughput manpower overlay"
-        if source_key == "live" and live_df is not None and not live_df.empty:
-            label += " · Superset snapshot refreshed"
     if df is None and throughput_df is not None:
         df = throughput_df
-        label = "Throughput CSV — picker_packer_hourly_throughput_4w.csv"
+        label = "Superset throughput (source of truth) · created_at hour grain"
+        if source_key == "live" and live_df is not None and not live_df.empty:
+            label += " · refreshed from Superset"
+        # Persist verification stats for sidebar banner.
+        verif = _verification_delta(throughput_df, hourly_orders_df)
+        if verif is not None:
+            st.session_state["_verification"] = verif
+        else:
+            st.session_state.pop("_verification", None)
+    if df is None and hourly_orders_df is not None:
+        df = hourly_orders_df
+        label = "Rolling Hourly Orders CSV (Superset throughput unavailable)"
     if df is None and live_df is not None and not live_df.empty:
         df = live_df
-        label = "Live Superset (CSV missing)"
+        label = "Live Superset (snapshot only)"
     if df is None:
         snaps = sorted(SNAPSHOTS_DIR.glob("picker_sim_*.csv"))
         if snaps:
@@ -946,6 +967,22 @@ def render_sidebar(df: pd.DataFrame, source_label: str) -> dict:
         err = st.session_state.get("_fetch_error")
         if err:
             st.sidebar.warning(err)
+
+    verif = st.session_state.get("_verification")
+    if verif:
+        max_d = verif["max_abs_delta"]
+        if max_d <= 5:
+            tone = "success"
+        elif max_d <= 15:
+            tone = "info"
+        else:
+            tone = "warning"
+        msg = (
+            f"CSV verification ({verif['days']}d): "
+            f"mean Δ {verif['mean_abs_delta']:.1f} / max Δ {max_d} orders·CH⁻¹·day⁻¹. "
+            f"Latest match {verif['latest_date']}."
+        )
+        getattr(st.sidebar, tone)(msg)
 
     st.sidebar.divider()
 

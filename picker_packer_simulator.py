@@ -1397,8 +1397,11 @@ def render_tab_raw(df: pd.DataFrame, params: dict) -> None:
         }
     ).sort_values(["Date", "Hour", "CH"], ascending=[False, True, True])
 
-    st.dataframe(
-        show.style.format(
+    # Streamlit Cloud can fail while marshalling large pandas Styler payloads.
+    # Fall back to plain dataframe rendering for large tables.
+    should_use_styler = len(show) <= 10000
+    if should_use_styler:
+        table_data = show.style.format(
             {
                 "UPO": "{:.2f}",
                 "UPH Picker Required for 0 Breach": "{:.0f}",
@@ -1411,7 +1414,15 @@ def render_tab_raw(df: pd.DataFrame, params: dict) -> None:
                 else ""
             ),
             subset=["Pick Breach Orders", "Pack Breach Orders"],
-        ),
+        )
+    else:
+        st.caption(
+            f"Showing {len(show):,} rows without cell styling to keep the app stable on Streamlit Cloud."
+        )
+        table_data = show
+
+    st.dataframe(
+        table_data,
         use_container_width=True,
         hide_index=True,
         height=440,

@@ -23,7 +23,10 @@ EXPORTS_DIR = REPO_ROOT / "data" / "exports"
 SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-THROUGHPUT_CSV = EXPORTS_DIR / "picker_packer_hourly_throughput_4w.csv"
+CENTRAL_EXPORTS_DIR = REPO_ROOT.parent / "data" / "exports"
+THROUGHPUT_CSV = CENTRAL_EXPORTS_DIR / "picker_packer_hourly_throughput_4w.csv"
+LOCAL_THROUGHPUT_CSV = EXPORTS_DIR / "picker_packer_hourly_throughput_4w.csv"
+REFERENCE_THROUGHPUT_CSV = REPO_ROOT / "data" / "reference" / "picker_packer_hourly_throughput_4w.csv"
 DEFAULT_OPD_PATH = (
     Path.home()
     / "Downloads"
@@ -419,9 +422,13 @@ def kpi_card(
 
 # ─── DATA FETCH ───────────────────────────────────────────────────────────────
 def _from_throughput_csv() -> Optional[pd.DataFrame]:
-    if not THROUGHPUT_CSV.exists():
+    source_path = next(
+        (p for p in [THROUGHPUT_CSV, LOCAL_THROUGHPUT_CSV, REFERENCE_THROUGHPUT_CSV] if p.exists()),
+        None,
+    )
+    if source_path is None:
         return None
-    df = pd.read_csv(THROUGHPUT_CSV)
+    df = pd.read_csv(source_path)
     out = pd.DataFrame(
         {
             "order_date": pd.to_datetime(df["event_date"]).dt.date,
@@ -431,6 +438,15 @@ def _from_throughput_csv() -> Optional[pd.DataFrame]:
             "total_units": df["units_picked"].fillna(0).astype(int),
         }
     )
+    optional_cols = {
+        "active_pickers": "actual_pickers",
+        "active_packers": "actual_packers",
+        "orders_packed": "orders_packed",
+        "units_packed": "units_packed",
+    }
+    for source_col, target_col in optional_cols.items():
+        if source_col in df.columns:
+            out[target_col] = df[source_col].fillna(0).astype(int)
     return out[out["order_count"] > 0].reset_index(drop=True)
 
 
@@ -571,7 +587,7 @@ def load_data(source_key: str) -> tuple[pd.DataFrame, str]:
     if df is None:
         df = _from_throughput_csv()
         if df is not None:
-            label = f"Throughput CSV — {THROUGHPUT_CSV.name}"
+            label = "Throughput CSV — picker_packer_hourly_throughput_4w.csv"
     if df is None:
         df = _from_hourly_orders_csv()
         if df is not None:
@@ -589,6 +605,11 @@ def load_data(source_key: str) -> tuple[pd.DataFrame, str]:
     df["order_hour"] = df["order_hour"].astype(int)
     df["order_count"] = df["order_count"].astype(int)
     df["total_units"] = df["total_units"].astype(int)
+    for col in ["actual_pickers", "actual_packers", "orders_packed", "units_packed"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        else:
+            df[col] = np.nan
     df["ch_name"] = df["ch_id"]
     df["upo"] = np.where(df["order_count"] > 0, df["total_units"] / df["order_count"], 0.0)
     df["dow"] = pd.to_datetime(df["order_date"]).dt.day_name().str[:3]
@@ -598,9 +619,13 @@ def load_data(source_key: str) -> tuple[pd.DataFrame, str]:
 # ─── FORWARD PLAN HELPERS ─────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_throughput_baseline() -> Optional[pd.DataFrame]:
-    if not THROUGHPUT_CSV.exists():
+    source_path = next(
+        (p for p in [THROUGHPUT_CSV, LOCAL_THROUGHPUT_CSV, REFERENCE_THROUGHPUT_CSV] if p.exists()),
+        None,
+    )
+    if source_path is None:
         return None
-    df = pd.read_csv(THROUGHPUT_CSV)
+    df = pd.read_csv(source_path)
     df["event_date"] = pd.to_datetime(df["event_date"]).dt.date
     df["event_hour"] = df["event_hour"].astype(int)
     return df
@@ -988,12 +1013,22 @@ def render_kpis(df: pd.DataFrame, params: dict) -> None:
         return
 
     n_days = max(df["order_date"].nunique(), 1)
-    avg_pickers = df["pickers_required"].mean()
-    avg_packers = df["packers_required"].mean()
+    has_actual_counts = (
+        "actual_pickers" in df.columns
+        and "actual_packers" in df.columns
+        and df["actual_pickers"].notna().any()
+        and df["actual_packers"].notna().any()
+    )
+    picker_count_col = "actual_pickers" if has_actual_counts else "pickers_required"
+    packer_count_col = "actual_packers" if has_actual_counts else "packers_required"
+    count_source = "Superset active users" if has_actual_counts else "Modeled required"
 
-    peak_idx = (df["pickers_required"] + df["packers_required"]).idxmax()
+    avg_pickers = df[picker_count_col].mean()
+    avg_packers = df[packer_count_col].mean()
+
+    peak_idx = (df[picker_count_col] + df[packer_count_col]).idxmax()
     peak_row = df.loc[peak_idx]
-    peak_total = int(peak_row["pickers_required"] + peak_row["packers_required"])
+    peak_total = int(peak_row[picker_count_col] + peak_row[packer_count_col])
     peak_label = f"{peak_row['order_date']}  {int(peak_row['order_hour']):02d}:00  {peak_row['ch_id']}"
 
     total_orders = df["order_count"].sum()
@@ -1004,13 +1039,13 @@ def render_kpis(df: pd.DataFrame, params: dict) -> None:
 
     distinct_pickers_avg, _ = compute_distinct_two_shift(
         df,
-        role_col="pickers_required",
+        role_col=picker_count_col,
         shift_hours=params["picker_shift_hours"],
         hour_range=params["hour_range"],
     )
     distinct_packers_avg, _ = compute_distinct_two_shift(
         df,
-        role_col="packers_required",
+        role_col=packer_count_col,
         shift_hours=params["packer_shift_hours"],
         hour_range=params["hour_range"],
     )
@@ -1028,18 +1063,18 @@ def render_kpis(df: pd.DataFrame, params: dict) -> None:
     section_label("Staffing")
     c = st.columns(5)
     cards_row1 = [
-        kpi_card("Avg Pickers / Hr", f"{avg_pickers:.1f}", "Concurrent, per CH"),
-        kpi_card("Avg Packers / Hr", f"{avg_packers:.1f}", "Concurrent, per CH"),
+        kpi_card("Avg Pickers / Hr", f"{avg_pickers:.1f}", f"{count_source}, per CH"),
+        kpi_card("Avg Packers / Hr", f"{avg_packers:.1f}", f"{count_source}, per CH"),
         kpi_card("Peak Hr Headcount", str(peak_total), peak_label),
         kpi_card(
             f"Distinct Pickers / Day",
             str(distinct_pickers),
-            f"2 shifts × {params['picker_shift_hours']}h",
+            f"{count_source}; 2 shifts × {params['picker_shift_hours']}h",
         ),
         kpi_card(
             f"Distinct Packers / Day",
             str(distinct_packers),
-            f"2 shifts × {params['packer_shift_hours']}h",
+            f"{count_source}; 2 shifts × {params['packer_shift_hours']}h",
         ),
     ]
     for col, card in zip(c, cards_row1):
@@ -1083,25 +1118,41 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
     if df.empty:
         st.info("No data.")
         return
+    has_actual_counts = (
+        "actual_pickers" in df.columns
+        and "actual_packers" in df.columns
+        and df["actual_pickers"].notna().any()
+        and df["actual_packers"].notna().any()
+    )
 
     st.markdown(
         '<p style="font-size:12px;color:#6B7280;margin:0 0 16px 0;">'
-        "<b style='color:#374151;'>Constrained</b> (solid) — headcount deployable under the CH cap. "
+        + (
+            "<b style='color:#374151;'>Actual</b> (solid) — active users from Superset audit logs. "
+            if has_actual_counts
+            else ""
+        )
+        + "<b style='color:#374151;'>Constrained</b> (solid) — headcount deployable under the CH cap. "
         "<b style='color:#374151;'>Ideal</b> (dashed) — headcount needed with no cap. "
         "Shaded area = understaffing exposure."
         "</p>",
         unsafe_allow_html=True,
     )
 
+    hourly_aggs = {
+        "pickers_required": ("pickers_required", "mean"),
+        "packers_required": ("packers_required", "mean"),
+        "pickers_ideal": ("pickers_uncapped", "mean"),
+        "packers_ideal": ("packers_uncapped", "mean"),
+        "units": ("total_units", "mean"),
+    }
+    if has_actual_counts:
+        hourly_aggs["actual_pickers"] = ("actual_pickers", "mean")
+        hourly_aggs["actual_packers"] = ("actual_packers", "mean")
+
     by_hour = (
         df.groupby("order_hour")
-        .agg(
-            pickers_required=("pickers_required", "mean"),
-            packers_required=("packers_required", "mean"),
-            pickers_ideal=("pickers_uncapped", "mean"),
-            packers_ideal=("packers_uncapped", "mean"),
-            units=("total_units", "mean"),
-        )
+        .agg(**hourly_aggs)
         .reset_index()
     )
 
@@ -1163,24 +1214,48 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
         go.Scatter(
             x=by_hour["order_hour"],
             y=by_hour["pickers_required"],
-            name="Pickers — constrained",
+            name="Pickers — modeled constrained",
             mode="lines+markers",
-            line=dict(color="#111111", width=2.5),
+            line=dict(color="#9CA3AF" if has_actual_counts else "#111111", width=2.5),
             marker=dict(size=5, color="#111111"),
-            hovertemplate="Pickers constrained: %{y:.1f}<extra></extra>",
+            hovertemplate="Pickers modeled constrained: %{y:.1f}<extra></extra>",
         )
     )
     fig.add_trace(
         go.Scatter(
             x=by_hour["order_hour"],
             y=by_hour["packers_required"],
-            name="Packers — constrained",
+            name="Packers — modeled constrained",
             mode="lines+markers",
-            line=dict(color="#8B5CF6", width=2.5),
+            line=dict(color="#C4B5FD" if has_actual_counts else "#8B5CF6", width=2.5),
             marker=dict(size=5, color="#8B5CF6"),
-            hovertemplate="Packers constrained: %{y:.1f}<extra></extra>",
+            hovertemplate="Packers modeled constrained: %{y:.1f}<extra></extra>",
         )
     )
+
+    if has_actual_counts:
+        fig.add_trace(
+            go.Scatter(
+                x=by_hour["order_hour"],
+                y=by_hour["actual_pickers"],
+                name="Pickers — actual",
+                mode="lines+markers",
+                line=dict(color="#111111", width=3),
+                marker=dict(size=6, color="#111111"),
+                hovertemplate="Pickers actual: %{y:.1f}<extra></extra>",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=by_hour["order_hour"],
+                y=by_hour["actual_packers"],
+                name="Packers — actual",
+                mode="lines+markers",
+                line=dict(color="#8B5CF6", width=3),
+                marker=dict(size=6, color="#8B5CF6"),
+                hovertemplate="Packers actual: %{y:.1f}<extra></extra>",
+            )
+        )
 
     # Units on secondary axis
     fig.add_trace(
@@ -1222,8 +1297,15 @@ def render_tab_hourly(df: pd.DataFrame, params: dict) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
     with st.expander("How is this calculated?", expanded=False):
+        actual_formula = (
+            "actual_pickers / actual_packers = COUNT(DISTINCT user_id) from "
+            "fulfilment_order_audits PICKED/PACKED events<br><br>"
+            if has_actual_counts
+            else ""
+        )
         formula_box(
-            f"pickers_ideal      = ceil( units / {params['picker_throughput']} "
+            actual_formula
+            + f"pickers_ideal      = ceil( units / {params['picker_throughput']} "
             f"× {1 + params['picker_buffer']/100:.2f} )  — no cap applied<br>"
             f"pickers_constrained = min( pickers_ideal, {params['max_pickers_per_ch']} )<br><br>"
             f"packers_ideal      = ceil( units / {params['packer_throughput']} "
@@ -1238,18 +1320,32 @@ def render_tab_raw(df: pd.DataFrame, params: dict) -> None:
         st.info("No data.")
         return
 
-    show = df[
+    display_cols = [
+        "order_date", "order_hour", "ch_id",
+        "order_count", "total_units", "upo",
+    ]
+    has_actual_counts = (
+        "actual_pickers" in df.columns
+        and "actual_packers" in df.columns
+        and df["actual_pickers"].notna().any()
+        and df["actual_packers"].notna().any()
+    )
+    if has_actual_counts:
+        display_cols.extend(["actual_pickers", "actual_packers", "orders_packed", "units_packed"])
+    display_cols.extend(
         [
-            "order_date", "order_hour", "ch_id",
-            "order_count", "total_units", "upo",
             "pickers_uncapped", "pickers_required", "pick_breach_orders",
             "packers_uncapped", "packers_required", "pack_breach_orders",
             "uph_picker", "uph_packer",
         ]
-    ].rename(
+    )
+
+    show = df[display_cols].rename(
         columns={
             "order_date": "Date", "order_hour": "Hour", "ch_id": "CH",
             "order_count": "Orders", "total_units": "Units", "upo": "UPO",
+            "actual_pickers": "Actual Pickers", "actual_packers": "Actual Packers",
+            "orders_packed": "Orders Packed", "units_packed": "Units Packed",
             "pickers_uncapped": "Pickers Ideal", "pickers_required": "Pickers Constrained",
             "pick_breach_orders": "Pick Breach Orders",
             "packers_uncapped": "Packers Ideal", "packers_required": "Packers Constrained",
@@ -1288,8 +1384,14 @@ def render_tab_raw(df: pd.DataFrame, params: dict) -> None:
     )
 
     with st.expander("Column definitions", expanded=False):
+        actual_definition = (
+            "Actual Pickers / Packers = distinct audit users in PICKED/PACKED events for that CH-hour<br>"
+            if has_actual_counts
+            else ""
+        )
         formula_box(
-            f"Pickers Ideal      = ceil( Units / {params['picker_throughput']} "
+            actual_definition
+            + f"Pickers Ideal      = ceil( Units / {params['picker_throughput']} "
             f"× {1 + params['picker_buffer']/100:.2f} )  uncapped need<br>"
             f"Pickers Constrained = min( Pickers Ideal, {params['max_pickers_per_ch']} )<br>"
             "Pick Breach Orders  = (Pickers Ideal − Pickers Constrained) × throughput / UPO<br>"
